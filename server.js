@@ -1,274 +1,395 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const http = require('http');
-const { Server } = require('socket.io');
-const connectDatabase = require('./config/database');
-const cron = require('node-cron');
-const FailsafeService = require('./services/failsafeService');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const fs = require('fs').promises;
+const path = require('path');
 
-// Initialize Express app
 const app = express();
-const server = http.createServer(app);
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY || 'your-greenhouse-api-key-2024';
 
-// Initialize Socket.IO
-const io = new Server(server, {
+// Middleware
+app.use(helmet());
+app.use(cors());
+app.use(morgan('combined'));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.static('public'));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later.'
+});
+app.use('/api', limiter);
+
+// In-memory storage (replace with database in production)
+let sensorData = [];
+let latestData = null;
+let deviceStatus = {};
+let controlHistory = [];
+
+// API Key middleware
+const authenticateAPI = (req, res, next) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token || token !== API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized - Invalid API key' });
+  }
+  next();
+};
+
+// Helper function to log data to file (optional persistence)
+const logToFile = async (data, type = 'sensor') => {
+  try {
+    const logDir = path.join(__dirname, 'logs');
+    await fs.mkdir(logDir, { recursive: true });
+    
+    const filename = `${type}-${new Date().toISOString().split('T')[0]}.json`;
+    const filepath = path.join(logDir, filename);
+    
+    let existingData = [];
+    try {
+      const fileContent = await fs.readFile(filepath, 'utf8');
+      existingData = JSON.parse(fileContent);
+    } catch (error) {
+      // File doesn't exist or is empty, start fresh
+    }
+    
+    existingData.push({
+      timestamp: new Date().toISOString(),
+      data: data
+    });
+    
+    // Keep only last 1000 entries per file
+    if (existingData.length > 1000) {
+      existingData = existingData.slice(-1000);
+    }
+    
+    await fs.writeFile(filepath, JSON.stringify(existingData, null, 2));
+  } catch (error) {
+    console.error('Error logging to file:', error);
+  }
+};
+
+// Routes
+
+// Root route - API documentation
+app.get('/', (req, res) => {
+  res.json({
+    name: 'Smart Greenhouse API',
+    version: '1.0.0',
+    endpoints: {
+      'GET /api/status': 'Get API status',
+      'GET /api/data/latest': 'Get latest sensor data',
+      'GET /api/data/history': 'Get historical sensor data',
+      'POST /api/sensor-data': 'Receive sensor data from ESP32',
+      'POST /api/control': 'Send control commands',
+      'GET /api/devices': 'List connected devices',
+      'GET /api/control/history': 'Get control command history'
+    },
+    authentication: 'Bearer token required for all API endpoints',
+    documentation: 'https://your-docs-url.com'
+  });
+});
+
+// API Status
+app.get('/api/status', authenticateAPI, (req, res) => {
+  res.json({
+    status: 'online',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    connectedDevices: Object.keys(deviceStatus).length,
+    latestDataAge: latestData ? (Date.now() - new Date(latestData.receivedAt).getTime()) / 1000 : null
+  });
+});
+
+// Receive sensor data from ESP32
+app.post('/api/sensor-data', authenticateAPI, async (req, res) => {
+  try {
+    const data = {
+      ...req.body,
+      receivedAt: new Date().toISOString(),
+      ip: req.ip
+    };
+    
+    // Store data
+    sensorData.push(data);
+    latestData = data;
+    
+    // Update device status
+    if (data.deviceId) {
+      deviceStatus[data.deviceId] = {
+        lastSeen: new Date().toISOString(),
+        ip: req.ip,
+        status: 'online'
+      };
+    }
+    
+    // Keep only last 1000 entries in memory
+    if (sensorData.length > 1000) {
+      sensorData = sensorData.slice(-1000);
+    }
+    
+    // Log to file for persistence
+    await logToFile(data, 'sensor');
+    
+    console.log(`Sensor data received from ${data.deviceId || 'unknown device'}`);
+    
+    res.json({
+      status: 'success',
+      message: 'Sensor data received',
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('Error processing sensor data:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to process sensor data'
+    });
+  }
+});
+
+// Get latest sensor data
+app.get('/api/data/latest', authenticateAPI, (req, res) => {
+  if (!latestData) {
+    return res.status(404).json({
+      error: 'No data available',
+      message: 'No sensor data has been received yet'
+    });
+  }
+  
+  res.json({
+    status: 'success',
+    data: latestData,
+    age: (Date.now() - new Date(latestData.receivedAt).getTime()) / 1000
+  });
+});
+
+// Get historical sensor data
+app.get('/api/data/history', authenticateAPI, (req, res) => {
+  const { limit = 100, from, to, deviceId } = req.query;
+  
+  let filteredData = [...sensorData];
+  
+  // Filter by device ID
+  if (deviceId) {
+    filteredData = filteredData.filter(d => d.deviceId === deviceId);
+  }
+  
+  // Filter by date range
+  if (from) {
+    const fromDate = new Date(from);
+    filteredData = filteredData.filter(d => new Date(d.receivedAt) >= fromDate);
+  }
+  
+  if (to) {
+    const toDate = new Date(to);
+    filteredData = filteredData.filter(d => new Date(d.receivedAt) <= toDate);
+  }
+  
+  // Limit results
+  const limitNum = Math.min(parseInt(limit), 1000);
+  filteredData = filteredData.slice(-limitNum);
+  
+  res.json({
+    status: 'success',
+    count: filteredData.length,
+    data: filteredData
+  });
+});
+
+// Send control commands
+app.post('/api/control', authenticateAPI, async (req, res) => {
+  try {
+    const { command, deviceId, description } = req.body;
+    
+    if (!command) {
+      return res.status(400).json({
+        error: 'Bad request',
+        message: 'Command is required'
+      });
+    }
+    
+    // Valid commands
+    const validCommands = [
+      'WATER:AUTO', 'WATER:MANUAL:ON', 'WATER:MANUAL:OFF',
+      'FAN:AUTO', 'FAN:MANUAL:ON', 'FAN:MANUAL:OFF',
+      'FERTILIZER:ON', 'FERTILIZER:OFF'
+    ];
+    
+    if (!validCommands.includes(command)) {
+      return res.status(400).json({
+        error: 'Invalid command',
+        message: 'Command not recognized',
+        validCommands
+      });
+    }
+    
+    // Store control command
+    const controlCommand = {
+      command,
+      deviceId,
+      description,
+      timestamp: new Date().toISOString(),
+      ip: req.ip,
+      status: 'sent'
+    };
+    
+    controlHistory.push(controlCommand);
+    
+    // Keep only last 500 control commands
+    if (controlHistory.length > 500) {
+      controlHistory = controlHistory.slice(-500);
+    }
+    
+    // Log to file
+    await logToFile(controlCommand, 'control');
+    
+    console.log(`Control command sent: ${command} to ${deviceId || 'all devices'}`);
+    
+    res.json({
+      status: 'success',
+      message: 'Control command queued',
+      command: controlCommand
+    });
+    
+    // Note: In a real implementation, you'd forward this command to the ESP32
+    // This could be done via WebSocket, MQTT, or by storing it for the ESP32 to poll
+    
+  } catch (error) {
+    console.error('Error processing control command:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to process control command'
+    });
+  }
+});
+
+// Get connected devices
+app.get('/api/devices', authenticateAPI, (req, res) => {
+  const devices = Object.entries(deviceStatus).map(([deviceId, status]) => ({
+    deviceId,
+    ...status,
+    online: (Date.now() - new Date(status.lastSeen).getTime()) < 120000 // 2 minutes
+  }));
+  
+  res.json({
+    status: 'success',
+    count: devices.length,
+    devices
+  });
+});
+
+// Get control command history
+app.get('/api/control/history', authenticateAPI, (req, res) => {
+  const { limit = 50, deviceId } = req.query;
+  
+  let filteredHistory = [...controlHistory];
+  
+  if (deviceId) {
+    filteredHistory = filteredHistory.filter(cmd => cmd.deviceId === deviceId);
+  }
+  
+  const limitNum = Math.min(parseInt(limit), 500);
+  filteredHistory = filteredHistory.slice(-limitNum).reverse();
+  
+  res.json({
+    status: 'success',
+    count: filteredHistory.length,
+    data: filteredHistory
+  });
+});
+
+// WebSocket endpoint for real-time updates (optional)
+const http = require('http');
+const socketIo = require('socket.io');
+
+const server = http.createServer(app);
+const io = socketIo(server, {
   cors: {
-    origin: process.env.ALLOWED_ORIGINS?.split(',') || ["http://localhost:3000"],
+    origin: "*",
     methods: ["GET", "POST"]
   }
 });
 
-// Connect to database
-connectDatabase();
-
-// Initialize failsafe service after database connection
-let failsafeService = null;
-
-// Security middleware
-app.use(helmet());
-
-// CORS middleware
-app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS?.split(',') || ["http://localhost:3000"],
-  credentials: true
-}));
-
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: parseInt(process.env.MAX_REQUESTS_PER_MINUTE) || 100,
-  message: {
-    success: false,
-    message: 'Too many requests from this IP, please try again later.'
-  },
-  standardHeaders: true,
-  legacyHeaders: false
+// WebSocket authentication
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
+  if (token === API_KEY) {
+    next();
+  } else {
+    next(new Error('Authentication error'));
+  }
 });
-app.use('/api', limiter);
 
-// Body parsing middleware
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
-
-// Add Socket.IO to request object for use in controllers
-app.use((req, res, next) => {
-  req.io = io;
-  next();
+io.on('connection', (socket) => {
+  console.log('WebSocket client connected');
+  
+  // Send latest data on connection
+  if (latestData) {
+    socket.emit('sensorData', latestData);
+  }
+  
+  socket.on('disconnect', () => {
+    console.log('WebSocket client disconnected');
+  });
 });
+
+// Emit real-time data to WebSocket clients
+const originalPush = sensorData.push;
+sensorData.push = function(...args) {
+  const result = originalPush.apply(this, args);
+  if (args[0]) {
+    io.emit('sensorData', args[0]);
+  }
+  return result;
+};
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({
-    success: true,
-    message: 'AgriSmart Greenhouse Server is running!',
+  res.json({ 
+    status: 'healthy', 
     timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    environment: process.env.NODE_ENV || 'development'
+    uptime: process.uptime()
   });
 });
 
-// API Routes
-app.use('/api/auth', require('./routes/auth'));
-app.use('/api/sensors', require('./routes/sensors'));
-app.use('/api/control', require('./routes/control'));
-
-// API Documentation endpoint
-app.get('/api', (req, res) => {
-  res.json({
-    success: true,
-    message: 'AgriSmart Greenhouse API',
-    version: '1.0.0',
-    endpoints: {
-      authentication: {
-        register: 'POST /api/auth/register',
-        login: 'POST /api/auth/login',
-        profile: 'GET /api/auth/me',
-        updateProfile: 'PUT /api/auth/profile',
-        changePassword: 'PUT /api/auth/change-password',
-        logout: 'POST /api/auth/logout'
-      },
-      sensors: {
-        receiveSensorData: 'POST /api/sensors/data (Device API Key required)',
-        getLatestData: 'GET /api/sensors/latest/:deviceId',
-        getHistory: 'GET /api/sensors/history/:deviceId',
-        getAggregatedData: 'GET /api/sensors/aggregate/:deviceId',
-        getDeviceStatus: 'GET /api/sensors/status/:deviceId'
-      },
-      control: {
-        getControlStates: 'GET /api/control/:deviceId',
-        toggleRelay: 'POST /api/control/:deviceId/toggle/:relayName',
-        setRelayState: 'PUT /api/control/:deviceId/relay/:relayName',
-        getHistory: 'GET /api/control/:deviceId/history',
-        updateAutomation: 'PUT /api/control/:deviceId/automation',
-        setOverride: 'POST /api/control/:deviceId/override',
-        removeOverride: 'DELETE /api/control/:deviceId/override',
-        getPendingCommands: 'GET /api/control/:deviceId/commands (Device API Key required)',
-        acknowledgeCommand: 'POST /api/control/:deviceId/commands/:commandId/ack (Device API Key required)',
-        updateDeviceStatus: 'POST /api/control/:deviceId/status (Device API Key required)'
-      }
-    },
-    documentation: 'Visit the GitHub repository for detailed API documentation'
-  });
-});
-
-// Socket.IO connection handling
-io.on('connection', (socket) => {
-  console.log(`🔌 Client connected: ${socket.id}`);
-  
-  // Join greenhouse-specific rooms
-  socket.on('join_greenhouse', (greenhouseId) => {
-    socket.join(`greenhouse_${greenhouseId}`);
-    console.log(`📡 Socket ${socket.id} joined greenhouse_${greenhouseId}`);
-  });
-  
-  // Leave greenhouse room
-  socket.on('leave_greenhouse', (greenhouseId) => {
-    socket.leave(`greenhouse_${greenhouseId}`);
-    console.log(`📡 Socket ${socket.id} left greenhouse_${greenhouseId}`);
-  });
-  
-  // Handle failsafe status request
-  socket.on('get_failsafe_status', (callback) => {
-    if (failsafeService) {
-      const status = failsafeService.getOfflineDevicesStatus();
-      callback({ success: true, data: status });
-    } else {
-      callback({ success: false, message: 'Failsafe service not available' });
-    }
-  });
-  
-  // Handle manual failsafe test
-  socket.on('test_failsafe', async (data, callback) => {
-    try {
-      if (failsafeService) {
-        const result = await failsafeService.manualFailsafeTest(data.deviceId, data.userId);
-        callback({ success: true, data: result });
-      } else {
-        callback({ success: false, message: 'Failsafe service not available' });
-      }
-    } catch (error) {
-      callback({ success: false, message: error.message });
-    }
-  });
-  
-  // Handle disconnection
-  socket.on('disconnect', () => {
-    console.log(`🔌 Client disconnected: ${socket.id}`);
-  });
-});
-
-// Global error handling middleware
-app.use((err, req, res, next) => {
-  console.error('🚨 Unhandled error:', err);
-  res.status(500).json({
-    success: false,
-    message: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message
-  });
-});
-
-// Handle 404 - Route not found
+// 404 handler
 app.use('*', (req, res) => {
   res.status(404).json({
-    success: false,
-    message: 'Route not found',
-    availableRoutes: {
-      health: 'GET /health',
-      api: 'GET /api',
-      auth: '/api/auth/*',
-      sensors: '/api/sensors/*',
-      control: '/api/control/*'
-    }
+    error: 'Not found',
+    message: 'The requested endpoint does not exist'
   });
 });
 
-// Scheduled tasks
-// Clean up old sensor data every day at 2 AM
-cron.schedule('0 2 * * *', async () => {
-  try {
-    console.log('🧹 Running scheduled cleanup of old sensor data...');
-    const SensorData = require('./models/SensorData');
-    const moment = require('moment');
-    
-    // Delete sensor data older than 90 days
-    const cutoffDate = moment().subtract(90, 'days').toDate();
-    const result = await SensorData.deleteMany({
-      createdAt: { $lt: cutoffDate }
-    });
-    
-    console.log(`🗑️  Cleaned up ${result.deletedCount} old sensor data records`);
-  } catch (error) {
-    console.error('❌ Error during scheduled cleanup:', error);
-  }
+// Error handler
+app.use((error, req, res, next) => {
+  console.error('Server error:', error);
+  res.status(500).json({
+    error: 'Internal server error',
+    message: 'An unexpected error occurred'
+  });
 });
 
-// Clean up old control history every week
-cron.schedule('0 3 * * 0', async () => {
-  try {
-    console.log('🧹 Running scheduled cleanup of old control history...');
-    const DeviceControl = require('./models/DeviceControl');
-    const moment = require('moment');
-    
-    // Remove control history older than 30 days from all devices
-    const cutoffDate = moment().subtract(30, 'days').toDate();
-    const devices = await DeviceControl.find({});
-    
-    let totalRemoved = 0;
-    for (const device of devices) {
-      const initialCount = device.controlHistory.length;
-      device.controlHistory = device.controlHistory.filter(
-        history => new Date(history.timestamp) >= cutoffDate
-      );
-      const removed = initialCount - device.controlHistory.length;
-      totalRemoved += removed;
-      
-      if (removed > 0) {
-        await device.save();
-      }
+// Cleanup old device status (mark offline after 5 minutes)
+setInterval(() => {
+  const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+  Object.keys(deviceStatus).forEach(deviceId => {
+    if (new Date(deviceStatus[deviceId].lastSeen).getTime() < fiveMinutesAgo) {
+      deviceStatus[deviceId].status = 'offline';
     }
-    
-    console.log(`🗑️  Cleaned up ${totalRemoved} old control history records`);
-  } catch (error) {
-    console.error('❌ Error during control history cleanup:', error);
-  }
-});
+  });
+}, 60000); // Check every minute
 
 // Start server
-const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(``);
-  console.log(`🌱 ================================== 🌱`);
-  console.log(`🌱     AgriSmart Greenhouse Server     🌱`);
-  console.log(`🌱 ================================== 🌱`);
-  console.log(``);
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`📡 Socket.IO enabled for real-time communication`);
-  console.log(`🔐 JWT Authentication enabled`);
-  console.log(`🛡️  Security middleware active`);
-  console.log(`⚡ Rate limiting: ${process.env.MAX_REQUESTS_PER_MINUTE || 100} req/min`);
-  console.log(``);
-  console.log(`📋 Available endpoints:`);
-  console.log(`   • Health Check: http://localhost:${PORT}/health`);
-  console.log(`   • API Documentation: http://localhost:${PORT}/api`);
-  console.log(`   • Authentication: http://localhost:${PORT}/api/auth/*`);
-  console.log(`   • Sensor Data: http://localhost:${PORT}/api/sensors/*`);
-  console.log(`   • Device Control: http://localhost:${PORT}/api/control/*`);
-  console.log(``);
-  console.log(`🔑 ESP32/Arduino API Key: ${process.env.ESP32_API_KEY}`);
-  console.log(`📊 MongoDB: ${process.env.MONGODB_URI?.replace(/\/\/.*@/, '//***:***@')}`);
-  console.log(``);
-  
-  // Initialize failsafe service after server starts
-  try {
-    failsafeService = new FailsafeService(io);
-    console.log(`🛡️  Failsafe monitoring system initialized`);
-  } catch (error) {
-    console.error(`❌ Failed to initialize failsafe service:`, error);
-  }
-  
-  console.log(`Ready to accept connections! 🎉`);
-  console.log(``);
+  console.log(`Smart Greenhouse Server running on port ${PORT}`);
+  console.log(`API Documentation: http://localhost:${PORT}`);
+  console.log(`Health Check: http://localhost:${PORT}/health`);
+  console.log(`API Key: ${API_KEY}`);
 });
+
+module.exports = app;
