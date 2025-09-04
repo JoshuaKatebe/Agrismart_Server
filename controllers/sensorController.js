@@ -9,10 +9,11 @@ const moment = require('moment');
 // @access  Device (API Key required)
 const receiveSensorData = async (req, res) => {
   try {
+    // Set default IDs if not provided
+    const deviceId = req.body.deviceId || 'defaultDeviceId';
+    const userId = req.body.userId || 'defaultUserId';
+    const greenhouseId = req.body.greenhouseId || 'defaultGreenhouseId';
     const {
-      deviceId,
-      userId,
-      greenhouseId,
       timestamp,
       sensors,
       actuators,
@@ -65,24 +66,38 @@ const receiveSensorData = async (req, res) => {
       };
     }
 
-    // Validate required fields
-    if (!deviceId || !userId || !greenhouseId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Device ID, User ID, and Greenhouse ID are required'
-      });
-    }
+    // Remove required field validation
+    // if (!deviceId || !userId || !greenhouseId) {
+    //   return res.status(400).json({
+    //     success: false,
+    //     message: 'Device ID, User ID, and Greenhouse ID are required'
+    //   });
+    // }
 
-    // Verify user and greenhouse exist
-    const user = await User.findById(userId);
+    // Optionally, skip user/greenhouse existence checks if using defaults
+    // const user = await User.findById(userId);
+    // if (!user) { ... }
+    // const greenhouse = await Greenhouse.findById(greenhouseId);
+    // if (!greenhouse) { ... }
+
+    // Instead, you can fetch the first user/greenhouse if IDs are default:
+    let user, greenhouse;
+    if (userId === 'defaultUserId') {
+      user = await User.findOne();
+    } else {
+      user = await User.findById(userId);
+    }
     if (!user) {
       return res.status(404).json({
         success: false,
         message: 'User not found'
       });
     }
-
-    const greenhouse = await Greenhouse.findById(greenhouseId);
+    if (greenhouseId === 'defaultGreenhouseId') {
+      greenhouse = await Greenhouse.findOne();
+    } else {
+      greenhouse = await Greenhouse.findById(greenhouseId);
+    }
     if (!greenhouse) {
       return res.status(404).json({
         success: false,
