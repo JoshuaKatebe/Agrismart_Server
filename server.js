@@ -1,14 +1,12 @@
 const express = require('express');
 const cors = require('cors');
-const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const morgan = require('morgan');
-const fs = require('fs').promises;
-const path = require('path');
+const http = require('http');
+const socketIo = require('socket.io');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || 'your-greenhouse-api-key-2024';
 
 // Middleware
 app.use(helmet());
@@ -17,61 +15,11 @@ app.use(morgan('combined'));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static('public'));
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: 'Too many requests from this IP, please try again later.'
-});
-app.use('/api', limiter);
-
-// In-memory storage (replace with database in production)
+// In-memory storage
 let sensorData = [];
 let latestData = null;
 let deviceStatus = {};
 let controlHistory = [];
-
-// API Key middleware
-const authenticateAPI = (req, res, next) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token || token !== API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized - Invalid API key' });
-  }
-  next();
-};
-
-// Helper function to log data to file (optional persistence)
-const logToFile = async (data, type = 'sensor') => {
-  try {
-    const logDir = path.join(__dirname, 'logs');
-    await fs.mkdir(logDir, { recursive: true });
-    
-    const filename = `${type}-${new Date().toISOString().split('T')[0]}.json`;
-    const filepath = path.join(logDir, filename);
-    
-    let existingData = [];
-    try {
-      const fileContent = await fs.readFile(filepath, 'utf8');
-      existingData = JSON.parse(fileContent);
-    } catch (error) {
-      // File doesn't exist or is empty, start fresh
-    }
-    
-    existingData.push({
-      timestamp: new Date().toISOString(),
-      data: data
-    });
-    
-    // Keep only last 1000 entries per file
-    if (existingData.length > 1000) {
-      existingData = existingData.slice(-1000);
-    }
-    
-    await fs.writeFile(filepath, JSON.stringify(existingData, null, 2));
-  } catch (error) {
-    console.error('Error logging to file:', error);
-  }
-};
 
 // Routes
 
@@ -88,14 +36,12 @@ app.get('/', (req, res) => {
       'POST /api/control': 'Send control commands',
       'GET /api/devices': 'List connected devices',
       'GET /api/control/history': 'Get control command history'
-    },
-    authentication: 'Bearer token required for all API endpoints',
-    documentation: 'https://your-docs-url.com'
+    }
   });
 });
 
 // API Status
-app.get('/api/status', authenticateAPI, (req, res) => {
+app.get('/api/status', (req, res) => {
   res.json({
     status: 'online',
     timestamp: new Date().toISOString(),
@@ -106,7 +52,7 @@ app.get('/api/status', authenticateAPI, (req, res) => {
 });
 
 // Receive sensor data from ESP32
-app.post('/api/sensor-data', authenticateAPI, async (req, res) => {
+app.post('/api/sensor-data', async (req, res) => {
   try {
     const data = {
       ...req.body,
@@ -132,10 +78,10 @@ app.post('/api/sensor-data', authenticateAPI, async (req, res) => {
       sensorData = sensorData.slice(-1000);
     }
     
-    // Log to file for persistence
-    await logToFile(data, 'sensor');
-    
     console.log(`Sensor data received from ${data.deviceId || 'unknown device'}`);
+    
+    // Emit to WebSocket clients
+    io.emit('sensorData', data);
     
     res.json({
       status: 'success',
@@ -153,7 +99,7 @@ app.post('/api/sensor-data', authenticateAPI, async (req, res) => {
 });
 
 // Get latest sensor data
-app.get('/api/data/latest', authenticateAPI, (req, res) => {
+app.get('/api/data/latest', (req, res) => {
   if (!latestData) {
     return res.status(404).json({
       error: 'No data available',
@@ -169,7 +115,7 @@ app.get('/api/data/latest', authenticateAPI, (req, res) => {
 });
 
 // Get historical sensor data
-app.get('/api/data/history', authenticateAPI, (req, res) => {
+app.get('/api/data/history', (req, res) => {
   const { limit = 100, from, to, deviceId } = req.query;
   
   let filteredData = [...sensorData];
@@ -202,7 +148,7 @@ app.get('/api/data/history', authenticateAPI, (req, res) => {
 });
 
 // Send control commands
-app.post('/api/control', authenticateAPI, async (req, res) => {
+app.post('/api/control', async (req, res) => {
   try {
     const { command, deviceId, description } = req.body;
     
@@ -245,19 +191,16 @@ app.post('/api/control', authenticateAPI, async (req, res) => {
       controlHistory = controlHistory.slice(-500);
     }
     
-    // Log to file
-    await logToFile(controlCommand, 'control');
-    
     console.log(`Control command sent: ${command} to ${deviceId || 'all devices'}`);
+    
+    // Emit control command to WebSocket clients (ESP32 can listen to this)
+    io.emit('controlCommand', controlCommand);
     
     res.json({
       status: 'success',
       message: 'Control command queued',
       command: controlCommand
     });
-    
-    // Note: In a real implementation, you'd forward this command to the ESP32
-    // This could be done via WebSocket, MQTT, or by storing it for the ESP32 to poll
     
   } catch (error) {
     console.error('Error processing control command:', error);
@@ -269,7 +212,7 @@ app.post('/api/control', authenticateAPI, async (req, res) => {
 });
 
 // Get connected devices
-app.get('/api/devices', authenticateAPI, (req, res) => {
+app.get('/api/devices', (req, res) => {
   const devices = Object.entries(deviceStatus).map(([deviceId, status]) => ({
     deviceId,
     ...status,
@@ -284,7 +227,7 @@ app.get('/api/devices', authenticateAPI, (req, res) => {
 });
 
 // Get control command history
-app.get('/api/control/history', authenticateAPI, (req, res) => {
+app.get('/api/control/history', (req, res) => {
   const { limit = 50, deviceId } = req.query;
   
   let filteredHistory = [...controlHistory];
@@ -303,25 +246,12 @@ app.get('/api/control/history', authenticateAPI, (req, res) => {
   });
 });
 
-// WebSocket endpoint for real-time updates (optional)
-const http = require('http');
-const socketIo = require('socket.io');
-
+// WebSocket setup
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
-  }
-});
-
-// WebSocket authentication
-io.use((socket, next) => {
-  const token = socket.handshake.auth.token;
-  if (token === API_KEY) {
-    next();
-  } else {
-    next(new Error('Authentication error'));
   }
 });
 
@@ -336,17 +266,13 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log('WebSocket client disconnected');
   });
+  
+  // Handle control commands from clients
+  socket.on('sendCommand', (command) => {
+    console.log('Command received via WebSocket:', command);
+    io.emit('controlCommand', command);
+  });
 });
-
-// Emit real-time data to WebSocket clients
-const originalPush = sensorData.push;
-sensorData.push = function(...args) {
-  const result = originalPush.apply(this, args);
-  if (args[0]) {
-    io.emit('sensorData', args[0]);
-  }
-  return result;
-};
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -385,11 +311,11 @@ setInterval(() => {
 }, 60000); // Check every minute
 
 // Start server
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`Smart Greenhouse Server running on port ${PORT}`);
-  console.log(`API Documentation: http://localhost:${PORT}`);
-  console.log(`Health Check: http://localhost:${PORT}/health`);
-  console.log(`API Key: ${API_KEY}`);
+  console.log(`API Documentation: https://agrismart-server-mxt0.onrender.com`);
+  console.log(`Health Check: https://agrismart-server-mxt0.onrender.com/health`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
 module.exports = app;
