@@ -6,7 +6,7 @@ const http = require('http');
 const socketIo = require('socket.io');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = 443;
 
 // Middleware
 app.use(helmet());
@@ -313,9 +313,8 @@ setInterval(() => {
 // Start server
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Smart Greenhouse Server running on port ${PORT}`);
-  console.log(`API Documentation: https://agrismart-server-mxt0.onrender.com`);
-  console.log(`Health Check: https://agrismart-server-mxt0.onrender.com/health`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`API Documentation: http://localhost:${PORT}`);
+  console.log(`Health Check: http://localhost:${PORT}/health`);
 });
 
 module.exports = app;
